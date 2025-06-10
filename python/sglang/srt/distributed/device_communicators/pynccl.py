@@ -3,6 +3,7 @@
 import logging
 from contextlib import contextmanager
 from typing import Optional, Union
+import ctypes
 
 # ===================== import region =====================
 import torch
@@ -14,10 +15,13 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     buffer_type,
     cudaStream_t,
     ncclComm_t,
+    ncclWindow_t,
     ncclDataTypeEnum,
     ncclRedOpTypeEnum,
+    ncclWinFlagEnum,
     ncclUniqueId,
 )
+from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.utils import StatelessProcessGroup
 
 logger = logging.getLogger(__name__)
@@ -118,9 +122,18 @@ class PyNcclCommunicator:
             del data
 
         # by default it is disabled, e.g. in profiling models and prefill phase.
-        # to use it, use under `with obj.change_state(enable=True)`, usually
-        # when we are using CUDA graph.
+        # to use it, use under `with obj.change_state(enable=True)` when using
+        # CUDA graph.
         self.disabled = True
+
+        # CUDA runtime wrapper used for memory copies.
+        self.cuda = CudaRTLibrary()
+
+        # Symmetric memory buffer and registered window.
+        self._symm_ptr: buffer_type = buffer_type()
+        self._symm_win: ncclWindow_t = ncclWindow_t()
+        self._symm_size = 0
+
 
     def all_reduce(
         self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
@@ -136,15 +149,20 @@ class PyNcclCommunicator:
         )
         if stream is None:
             stream = self.stream
+        size = tensor.numel() * tensor.element_size()
+        ptr = tensor.data_ptr()
+        self._ensure_window(size)
+        self.cuda.cudaMemcpy(self._symm_ptr, ctypes.c_void_p(ptr), size)
         self.nccl.ncclAllReduce(
-            buffer_type(tensor.data_ptr()),
-            buffer_type(tensor.data_ptr()),
+            self._symm_ptr,
+            self._symm_ptr,
             tensor.numel(),
             ncclDataTypeEnum.from_torch(tensor.dtype),
             ncclRedOpTypeEnum.from_torch(op),
             self.comm,
             cudaStream_t(stream.cuda_stream),
         )
+        self.cuda.cudaMemcpy(ctypes.c_void_p(ptr), self._symm_ptr, size)
 
     def all_gather(
         self, output_tensor: torch.Tensor, input_tensor: torch.Tensor, stream=None
@@ -282,3 +300,35 @@ class PyNcclCommunicator:
 
         self.disabled = old_disable
         self.stream = old_stream
+
+    def _ensure_window(self, size: int) -> None:
+        if size <= self._symm_size:
+            return
+        if self._symm_size > 0:
+            self.nccl.ncclCommWindowDeregister(self.comm, self._symm_win)
+            self.nccl.ncclMemFree(self._symm_ptr)
+        self._symm_ptr = self.nccl.ncclMemAlloc(size)
+        win = ncclWindow_t()
+        self.nccl.ncclCommWindowRegister(
+            self.comm,
+            self._symm_ptr,
+            size,
+            ctypes.byref(win),
+            ncclWinFlagEnum.NCCL_WIN_COLL_SYMMETRIC,
+        )
+        self._symm_win = win
+        self._symm_size = size
+
+    def close(self):
+        if self._symm_size > 0:
+            self.nccl.ncclCommWindowDeregister(self.comm, self._symm_win)
+            self.nccl.ncclMemFree(self._symm_ptr)
+            self._symm_size = 0
+            self._symm_ptr = buffer_type()
+            self._symm_win = ncclWindow_t()
+        if hasattr(self, "comm") and self.comm:
+            self.nccl.ncclCommDestroy(self.comm)
+            self.comm = ncclComm_t()
+
+    def __del__(self):
+        self.close()
